@@ -1,0 +1,1008 @@
+﻿
+# =====================================================================
+# SOIC — TEMPORAL VALIDATION + COMPUTATIONAL COST BENCHMARK
+#
+# Standalone Kaggle cell — no previous variables or models required.
+#
+# Outputs:
+# 1. RA_M2_RA_R8__temporal_model_results.csv
+# 2. SOIC__temporal_computational_cost.csv
+# 3. SOIC__temporal_selected_hyperparameters.csv
+# =====================================================================
+
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_DETERMINISTIC_OPS"] = "1"
+
+import sys
+import subprocess
+import importlib.util
+import random
+import time
+import platform
+import json
+import gc
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+
+from sklearn.model_selection import train_test_split, KFold, GridSearchCV
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from xgboost import XGBRegressor
+from IPython.display import display
+
+if importlib.util.find_spec("keras_tuner") is None:
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "-q", "keras-tuner"
+    ])
+
+import keras_tuner as kt
+
+# =====================================================================
+# 1. CONFIGURATION
+# =====================================================================
+
+SEED = 42
+EPOCHS = 100
+BATCH_SIZE = 32
+PATIENCE = 12
+OOF_FOLDS = 5
+TUNING_FOLDS = 3
+NN_TRIALS = 10
+
+INFERENCE_WARMUPS = 5
+INFERENCE_REPEATS = 30
+
+DATA_PATH = (
+    "/kaggle/input/datasets/patelris/crop-yield-prediction-dataset/yield_df.csv"
+)
+
+OUT_DIR = Path("/kaggle/working/SOIC_FINAL")
+TABLE_DIR = OUT_DIR / "tables"
+META_DIR = OUT_DIR / "metadata"
+
+TABLE_DIR.mkdir(parents=True, exist_ok=True)
+META_DIR.mkdir(parents=True, exist_ok=True)
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.keras.utils.set_random_seed(SEED)
+
+try:
+    tf.config.experimental.enable_op_determinism()
+except Exception:
+    pass
+
+FEATURES = [
+    "Area",
+    "Item",
+    "Year",
+    "average_rain_fall_mm_per_year",
+    "pesticides_tonnes",
+    "avg_temp"
+]
+
+TARGET = "hg/ha_yield"
+CATEGORICAL = ["Area", "Item"]
+NUMERICAL = [x for x in FEATURES if x not in CATEGORICAL]
+BASE = ["RF", "XGBoost", "NN"]
+
+# =====================================================================
+# 2. DATA LOADING AND CHRONOLOGICAL SPLIT
+# =====================================================================
+
+if not Path(DATA_PATH).exists():
+    raise FileNotFoundError(DATA_PATH)
+
+data = pd.read_csv(DATA_PATH)
+
+data = data.loc[
+    :, ~data.columns.astype(str).str.startswith("Unnamed:")
+].copy()
+
+data = data[FEATURES + [TARGET]].copy()
+
+for column in NUMERICAL + [TARGET]:
+    data[column] = pd.to_numeric(
+        data[column], errors="coerce"
+    )
+
+data = data.dropna().reset_index(drop=True)
+
+for column in CATEGORICAL:
+    data[column] = data[column].astype(str)
+
+years = np.sort(data["Year"].unique())
+
+# Match the final consolidated experimental code.
+if (
+    (data["Year"] < 2015).sum() >= 100
+    and (data["Year"] >= 2015).sum() >= 50
+):
+    CUTOFF = 2015
+else:
+    CUTOFF = int(np.quantile(years, 0.75))
+
+TRAIN = data[
+    data["Year"] < CUTOFF
+].reset_index(drop=True)
+
+TEST = data[
+    data["Year"] >= CUTOFF
+].reset_index(drop=True)
+
+if len(TRAIN) < 100 or len(TEST) < 40:
+    raise ValueError("Insufficient chronological observations.")
+
+print("=" * 70)
+print("SOIC TEMPORAL VALIDATION AND BENCHMARK")
+print("=" * 70)
+print(f"Dataset coverage: {years.min()}–{years.max()}")
+print(f"Training period: before {CUTOFF}")
+print(f"Testing period: {CUTOFF} onward")
+print(f"Training observations: {len(TRAIN):,}")
+print(f"Testing observations: {len(TEST):,}")
+
+Y_TEST = TEST[TARGET].to_numpy(dtype=float)
+
+# =====================================================================
+# 3. LEAKAGE-SAFE PREPROCESSING
+# =====================================================================
+
+def make_processor():
+    try:
+        encoder = OneHotEncoder(
+            handle_unknown="ignore",
+            sparse_output=False
+        )
+    except TypeError:
+        encoder = OneHotEncoder(
+            handle_unknown="ignore",
+            sparse=False
+        )
+
+    return ColumnTransformer(
+        transformers=[
+            ("categorical", encoder, CATEGORICAL),
+            ("numerical", StandardScaler(), NUMERICAL)
+        ],
+        sparse_threshold=0
+    )
+
+
+def prepare_features(train_df, other_df):
+    processor = make_processor()
+
+    X_train = np.asarray(
+        processor.fit_transform(train_df[FEATURES]),
+        dtype=np.float32
+    )
+
+    X_other = np.asarray(
+        processor.transform(other_df[FEATURES]),
+        dtype=np.float32
+    )
+
+    return processor, X_train, X_other
+
+
+def prepare_target(train_df):
+    scaler = StandardScaler()
+
+    y = train_df[TARGET].to_numpy(dtype=float)
+
+    scaled = scaler.fit_transform(
+        y.reshape(-1, 1)
+    ).ravel().astype(np.float32)
+
+    return scaler, scaled
+
+
+def inverse_target(scaler, prediction):
+    return scaler.inverse_transform(
+        np.asarray(prediction).reshape(-1, 1)
+    ).ravel()
+
+
+def evaluate(actual, predicted):
+    return {
+        "MAE": mean_absolute_error(actual, predicted),
+        "RMSE": np.sqrt(
+            mean_squared_error(actual, predicted)
+        ),
+        "R2": r2_score(actual, predicted)
+    }
+
+# =====================================================================
+# 4. NEURAL NETWORK ARCHITECTURE
+# =====================================================================
+
+def build_nn(input_dim, hp):
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(input_dim,))
+    ])
+
+    for i in range(int(hp["num_layers"])):
+        model.add(
+            tf.keras.layers.Dense(
+                int(hp[f"units_{i}"]),
+                activation="relu",
+                kernel_initializer="glorot_uniform",
+                bias_initializer="zeros"
+            )
+        )
+
+        model.add(
+            tf.keras.layers.BatchNormalization()
+        )
+
+        model.add(
+            tf.keras.layers.Dropout(
+                float(hp[f"dropout_{i}"])
+            )
+        )
+
+    model.add(tf.keras.layers.Dense(1))
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(
+            learning_rate=float(hp["learning_rate"])
+        ),
+        loss="mse",
+        metrics=["mae"]
+    )
+
+    return model
+
+
+def fit_nn(X, y, hp, seed=SEED):
+    tf.keras.backend.clear_session()
+    tf.keras.utils.set_random_seed(seed)
+
+    model = build_nn(X.shape[1], hp)
+
+    model.fit(
+        np.asarray(X, dtype=np.float32),
+        np.asarray(y, dtype=np.float32),
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        verbose=0
+    )
+
+    return model
+
+# =====================================================================
+# 5. HISTORICAL-ONLY TREE HYPERPARAMETER TUNING
+# =====================================================================
+
+def create_tree(name, hp):
+    if name == "RF":
+        return RandomForestRegressor(
+            random_state=SEED,
+            n_jobs=2,
+            **hp
+        )
+
+    return XGBRegressor(
+        random_state=SEED,
+        n_jobs=2,
+        tree_method="hist",
+        objective="reg:squarederror",
+        **hp
+    )
+
+
+def tune_tree(name):
+    if name == "RF":
+        estimator = RandomForestRegressor(
+            random_state=SEED,
+            n_jobs=2
+        )
+
+        grid = {
+            "model__n_estimators": [100, 200],
+            "model__max_depth": [10, 20, None],
+            "model__max_features": ["sqrt", "log2"]
+        }
+
+    else:
+        estimator = XGBRegressor(
+            random_state=SEED,
+            n_jobs=2,
+            tree_method="hist",
+            objective="reg:squarederror"
+        )
+
+        grid = {
+            "model__n_estimators": [100, 200],
+            "model__max_depth": [3, 6],
+            "model__learning_rate": [0.01, 0.1],
+            "model__subsample": [0.8, 1.0],
+            "model__colsample_bytree": [0.8, 1.0]
+        }
+
+    pipeline = Pipeline([
+        ("processor", make_processor()),
+        ("model", estimator)
+    ])
+
+    search = GridSearchCV(
+        pipeline,
+        grid,
+        cv=KFold(
+            n_splits=TUNING_FOLDS,
+            shuffle=True,
+            random_state=SEED
+        ),
+        scoring="neg_mean_absolute_error",
+        n_jobs=1,
+        refit=True
+    )
+
+    start = time.perf_counter()
+
+    search.fit(TRAIN[FEATURES], TRAIN[TARGET])
+
+    elapsed = time.perf_counter() - start
+
+    selected = {
+        k.replace("model__", ""): v
+        for k, v in search.best_params_.items()
+    }
+
+    return selected, elapsed
+
+
+print("\n[1/6] Random Forest hyperparameter tuning...")
+RF_HP, RF_TUNING_TIME = tune_tree("RF")
+
+print("[2/6] XGBoost hyperparameter tuning...")
+XGB_HP, XGB_TUNING_TIME = tune_tree("XGBoost")
+
+print("RF:", RF_HP)
+print("XGBoost:", XGB_HP)
+
+# =====================================================================
+# 6. HISTORICAL-ONLY NEURAL NETWORK TUNING
+# =====================================================================
+
+print("\n[3/6] Neural Network hyperparameter tuning...")
+
+DEV, VALID = train_test_split(
+    TRAIN,
+    test_size=0.15,
+    random_state=SEED
+)
+
+_, X_DEV, X_VALID = prepare_features(DEV, VALID)
+
+DEV_SCALER, Y_DEV = prepare_target(DEV)
+
+Y_VALID = DEV_SCALER.transform(
+    VALID[[TARGET]]
+).ravel().astype(np.float32)
+
+
+def nn_builder(hp):
+    count = hp.Int("num_layers", 1, 3)
+
+    parameters = {
+        "num_layers": count,
+        "learning_rate": hp.Float(
+            "learning_rate",
+            1e-4,
+            1e-2,
+            sampling="log"
+        )
+    }
+
+    for i in range(count):
+        parameters[f"units_{i}"] = hp.Int(
+            f"units_{i}",
+            32,
+            256,
+            step=32
+        )
+
+        parameters[f"dropout_{i}"] = hp.Float(
+            f"dropout_{i}",
+            0.2,
+            0.5,
+            step=0.1
+        )
+
+    return build_nn(
+        X_DEV.shape[1],
+        parameters
+    )
+
+
+tuner = kt.RandomSearch(
+    nn_builder,
+    objective="val_mae",
+    max_trials=NN_TRIALS,
+    seed=SEED,
+    executions_per_trial=1,
+    directory=str(META_DIR / "keras_tuner"),
+    project_name="temporal_benchmark",
+    overwrite=True
+)
+
+start = time.perf_counter()
+
+tuner.search(
+    X_DEV,
+    Y_DEV,
+    validation_data=(X_VALID, Y_VALID),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    callbacks=[
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=PATIENCE,
+            restore_best_weights=True
+        )
+    ],
+    verbose=0
+)
+
+NN_TUNING_TIME = time.perf_counter() - start
+
+chosen = tuner.get_best_hyperparameters(1)[0].values
+
+NN_HP = {
+    "num_layers": int(chosen["num_layers"]),
+    "learning_rate": float(chosen["learning_rate"])
+}
+
+for i in range(NN_HP["num_layers"]):
+    NN_HP[f"units_{i}"] = int(chosen[f"units_{i}"])
+    NN_HP[f"dropout_{i}"] = float(chosen[f"dropout_{i}"])
+
+print("NN:", NN_HP)
+
+# Save selected parameters
+hyperparameter_table = pd.DataFrame([
+    {
+        "Model": "Random Forest",
+        "Tuning_Seconds": RF_TUNING_TIME,
+        "Selected_Hyperparameters": json.dumps(RF_HP)
+    },
+    {
+        "Model": "XGBoost",
+        "Tuning_Seconds": XGB_TUNING_TIME,
+        "Selected_Hyperparameters": json.dumps(XGB_HP)
+    },
+    {
+        "Model": "Neural Network",
+        "Tuning_Seconds": NN_TUNING_TIME,
+        "Selected_Hyperparameters": json.dumps(NN_HP)
+    }
+])
+
+hyperparameter_table.to_csv(
+    TABLE_DIR / "SOIC__temporal_selected_hyperparameters.csv",
+    index=False
+)
+
+# =====================================================================
+# 7. BASE MODEL FITTING HELPERS
+# =====================================================================
+
+HP = {
+    "RF": RF_HP,
+    "XGBoost": XGB_HP,
+    "NN": NN_HP
+}
+
+
+def fit_base(name, X, y, seed=SEED):
+    if name == "NN":
+        return fit_nn(X, y, HP["NN"], seed=seed)
+
+    model = create_tree(name, HP[name])
+    model.fit(X, y)
+    return model
+
+
+def raw_prediction(name, model, X):
+    if name == "NN":
+        return model.predict(
+            np.asarray(X, dtype=np.float32),
+            verbose=0
+        ).ravel()
+
+    return np.asarray(model.predict(X)).ravel()
+
+# =====================================================================
+# 8. FIVE-FOLD OUT-OF-FOLD STACKING
+# =====================================================================
+
+print("\n[4/6] Building OOF stacking predictions...")
+
+OOF = np.full(
+    (len(TRAIN), len(BASE)),
+    np.nan,
+    dtype=float
+)
+
+folds = KFold(
+    n_splits=OOF_FOLDS,
+    shuffle=True,
+    random_state=SEED
+)
+
+OOF_START = time.perf_counter()
+
+for fold_index, (a, b) in enumerate(folds.split(TRAIN)):
+    train_fold = TRAIN.iloc[a]
+    validation_fold = TRAIN.iloc[b]
+
+    _, X_FOLD, X_VAL = prepare_features(
+        train_fold,
+        validation_fold
+    )
+
+    fold_scaler, Y_FOLD = prepare_target(train_fold)
+
+    for j, name in enumerate(BASE):
+        model = fit_base(
+            name,
+            X_FOLD,
+            Y_FOLD,
+            seed=SEED + fold_index
+        )
+
+        scaled_prediction = raw_prediction(
+            name,
+            model,
+            X_VAL
+        )
+
+        OOF[b, j] = inverse_target(
+            fold_scaler,
+            scaled_prediction
+        )
+
+        del model
+        gc.collect()
+
+    print(f"Completed fold {fold_index + 1}/{OOF_FOLDS}")
+
+if not np.isfinite(OOF).all():
+    raise RuntimeError("Invalid OOF predictions.")
+
+OOF_TIME = time.perf_counter() - OOF_START
+
+print(f"OOF generation time: {OOF_TIME:.2f} seconds")
+
+# =====================================================================
+# 9. RIDGE META-LEARNER TUNING AND TRAINING
+# =====================================================================
+
+print("\n[5/6] Tuning and fitting Ridge meta-learner...")
+
+Y_TRAIN_ORIGINAL = TRAIN[TARGET].to_numpy(dtype=float)
+
+RIDGE_ALPHAS = [
+    0.001, 0.01, 0.1, 1, 10, 100
+]
+
+META_START = time.perf_counter()
+
+META_CV = KFold(
+    n_splits=5,
+    shuffle=True,
+    random_state=SEED
+)
+
+alpha_results = []
+
+for alpha in RIDGE_ALPHAS:
+    scores = []
+
+    for a, b in META_CV.split(OOF):
+        trial_ridge = Ridge(alpha=alpha)
+
+        trial_ridge.fit(
+            OOF[a],
+            Y_TRAIN_ORIGINAL[a]
+        )
+
+        scores.append(
+            mean_absolute_error(
+                Y_TRAIN_ORIGINAL[b],
+                trial_ridge.predict(OOF[b])
+            )
+        )
+
+    alpha_results.append({
+        "Alpha": alpha,
+        "CV_MAE": np.mean(scores)
+    })
+
+BEST_ALPHA = min(
+    alpha_results,
+    key=lambda item: item["CV_MAE"]
+)["Alpha"]
+
+ridge = Ridge(alpha=BEST_ALPHA)
+ridge.fit(OOF, Y_TRAIN_ORIGINAL)
+
+META_TIME = time.perf_counter() - META_START
+
+print("Selected Ridge alpha:", BEST_ALPHA)
+print(f"Meta-learner tuning/fitting time: {META_TIME:.2f}s")
+
+# =====================================================================
+# 10. FINAL HISTORICAL TRAINING
+# =====================================================================
+
+print("\n[6/6] Fitting final models and measuring training times...")
+
+TOTAL_STACK_START = time.perf_counter()
+
+PROCESS_START = time.perf_counter()
+
+final_processor, XTRAIN, XTEST = prepare_features(
+    TRAIN,
+    TEST
+)
+
+final_scaler, YTRAIN_SCALED = prepare_target(TRAIN)
+
+PROCESS_TIME = time.perf_counter() - PROCESS_START
+
+final_models = {}
+final_fit_seconds = {}
+base_predictions = {}
+
+for name in BASE:
+    start = time.perf_counter()
+
+    model = fit_base(
+        name,
+        XTRAIN,
+        YTRAIN_SCALED
+    )
+
+    final_fit_seconds[name] = (
+        time.perf_counter() - start
+    )
+
+    final_models[name] = model
+
+    prediction_scaled = raw_prediction(
+        name,
+        model,
+        XTEST
+    )
+
+    base_predictions[name] = inverse_target(
+        final_scaler,
+        prediction_scaled
+    )
+
+    print(
+        f"{name} final fit time: "
+        f"{final_fit_seconds[name]:.2f}s"
+    )
+
+STACK_FEATURES = np.column_stack([
+    base_predictions[name]
+    for name in BASE
+])
+
+base_predictions["Stack_Ridge"] = ridge.predict(
+    STACK_FEATURES
+)
+
+FINAL_STAGE_ELAPSED = time.perf_counter() - TOTAL_STACK_START
+
+# Full stacking training is OOF generation + Ridge tuning/fitting
+# + preprocessing and final base-model refitting.
+#
+# The recorded stage times may include small timer/warm-up overhead.
+# Importantly, this is MEASURED, not 5x/6x an estimated learner time.
+
+STACK_TRAINING_SECONDS = (
+    OOF_TIME
+    + META_TIME
+    + PROCESS_TIME
+    + sum(final_fit_seconds.values())
+)
+
+# =====================================================================
+# 11. TEMPORAL VALIDATION METRICS
+# =====================================================================
+
+temporal_rows = []
+
+for name in BASE + ["Stack_Ridge"]:
+    temporal_rows.append({
+        "Model": name,
+        "Train_Before": CUTOFF,
+        "Test_From": CUTOFF,
+        "Train_Rows": len(TRAIN),
+        "Test_Rows": len(TEST),
+        **evaluate(
+            Y_TEST,
+            base_predictions[name]
+        )
+    })
+
+temporal_results = pd.DataFrame(temporal_rows)
+
+print("\n" + "=" * 70)
+print("TEMPORAL VALIDATION RESULTS")
+print("=" * 70)
+
+display(temporal_results.round(5))
+
+TEMPORAL_FILE = (
+    TABLE_DIR / "RA_M2_RA_R8__temporal_model_results.csv"
+)
+
+temporal_results.to_csv(
+    TEMPORAL_FILE,
+    index=False
+)
+
+# =====================================================================
+# 12. ACTUAL INFERENCE-TIME BENCHMARK
+#
+# Same test batch and hardware for every model.
+# Includes feature preprocessing and target inverse scaling.
+# Excludes model training and file loading.
+#
+# This is BATCH-AVERAGED latency per observation, not
+# single-request or single-observation prediction latency.
+# =====================================================================
+
+print("\nBenchmarking actual inference times...")
+
+def predict_complete_base(name):
+    X = np.asarray(
+        final_processor.transform(TEST[FEATURES]),
+        dtype=np.float32
+    )
+
+    result = raw_prediction(
+        name,
+        final_models[name],
+        X
+    )
+
+    return inverse_target(
+        final_scaler,
+        result
+    )
+
+
+def predict_complete_stack():
+    X = np.asarray(
+        final_processor.transform(TEST[FEATURES]),
+        dtype=np.float32
+    )
+
+    predictions = []
+
+    for name in BASE:
+        scaled = raw_prediction(
+            name,
+            final_models[name],
+            X
+        )
+
+        predictions.append(
+            inverse_target(
+                final_scaler,
+                scaled
+            )
+        )
+
+    return ridge.predict(
+        np.column_stack(predictions)
+    )
+
+
+functions = {
+    "RF": lambda: predict_complete_base("RF"),
+    "XGBoost": lambda: predict_complete_base("XGBoost"),
+    "NN": lambda: predict_complete_base("NN"),
+    "Stack_Ridge": predict_complete_stack
+}
+
+inference_rows = []
+
+for name, fn in functions.items():
+
+    print(f"Benchmarking {name}...")
+
+    # Warm-up predictions
+    for _ in range(INFERENCE_WARMUPS):
+        fn()
+
+    durations = []
+
+    for repeat in range(INFERENCE_REPEATS):
+        start = time.perf_counter()
+
+        result = fn()
+
+        duration = time.perf_counter() - start
+
+        if len(result) != len(TEST):
+            raise RuntimeError(
+                f"Invalid output length for {name}"
+            )
+
+        durations.append(duration)
+
+    durations = np.asarray(durations)
+
+    median_batch_ms = (
+        1000.0 * np.median(durations)
+    )
+
+    inference_rows.append({
+        "Model": name,
+        "Inference_ms_per_sample": (
+            median_batch_ms / len(TEST)
+        ),
+        "Median_batch_time_ms": median_batch_ms,
+        "Mean_batch_time_ms": (
+            1000.0 * np.mean(durations)
+        ),
+        "Std_batch_time_ms": (
+            1000.0 * np.std(durations)
+        ),
+        "Batch_size_samples": len(TEST),
+        "Repeats": INFERENCE_REPEATS
+    })
+
+inference_df = pd.DataFrame(inference_rows)
+
+# =====================================================================
+# 13. COMPLETE COMPUTATIONAL COST TABLE
+# =====================================================================
+
+# Tuning is measured independently of the refitting stage.
+#
+# For the stacking model, total tuning includes the three
+# base-model searches plus Ridge alpha selection.
+#
+# Stacking training includes OOF generation and the
+# final complete-training refits, but not base-model tuning.
+
+tuning_by_name = {
+    "RF": RF_TUNING_TIME,
+    "XGBoost": XGB_TUNING_TIME,
+    "NN": NN_TUNING_TIME
+}
+
+STACK_TUNING_SECONDS = (
+    RF_TUNING_TIME
+    + XGB_TUNING_TIME
+    + NN_TUNING_TIME
+    # Ridge alpha selection occurs inside META_TIME, which is
+    # included in STACK_TRAINING_SECONDS rather than here.
+)
+
+cost_rows = []
+
+for name in BASE + ["Stack_Ridge"]:
+
+    if name == "Stack_Ridge":
+        tuning = STACK_TUNING_SECONDS
+        training = STACK_TRAINING_SECONDS
+    else:
+        tuning = tuning_by_name[name]
+        training = final_fit_seconds[name]
+
+    infer = inference_df[
+        inference_df["Model"] == name
+    ].iloc[0]
+
+    cost_rows.append({
+        "Model": name,
+        "Tuning_time_s": tuning,
+        "Training_time_s": training,
+        "Inference_ms_per_sample": (
+            infer["Inference_ms_per_sample"]
+        ),
+        "Median_batch_time_ms": (
+            infer["Median_batch_time_ms"]
+        ),
+        "Test_samples": len(TEST),
+        "Training_samples": len(TRAIN),
+        "Train_Before": CUTOFF,
+        "Test_From": CUTOFF,
+        "Protocol": "Chronological validation",
+        "Hardware": platform.platform()
+    })
+
+computational_cost = pd.DataFrame(cost_rows)
+
+print("\n" + "=" * 70)
+print("MEASURED COMPUTATIONAL COST — CHRONOLOGICAL VALIDATION")
+print("=" * 70)
+
+display(
+    computational_cost[
+        [
+            "Model",
+            "Tuning_time_s",
+            "Training_time_s",
+            "Inference_ms_per_sample"
+        ]
+    ].round(5)
+)
+
+COST_FILE = (
+    TABLE_DIR / "SOIC__temporal_computational_cost.csv"
+)
+
+computational_cost.to_csv(
+    COST_FILE,
+    index=False
+)
+
+# Save detailed timing decomposition for reproducibility.
+timing_details = pd.DataFrame([
+    {"Stage": "RF tuning", "Seconds": RF_TUNING_TIME},
+    {"Stage": "XGBoost tuning", "Seconds": XGB_TUNING_TIME},
+    {"Stage": "NN tuning", "Seconds": NN_TUNING_TIME},
+    {"Stage": "OOF generation", "Seconds": OOF_TIME},
+    {"Stage": "Ridge selection and fitting", "Seconds": META_TIME},
+    {"Stage": "Final preprocessing", "Seconds": PROCESS_TIME},
+    {"Stage": "RF final fitting", "Seconds": final_fit_seconds["RF"]},
+    {"Stage": "XGBoost final fitting", "Seconds": final_fit_seconds["XGBoost"]},
+    {"Stage": "NN final fitting", "Seconds": final_fit_seconds["NN"]},
+    {
+        "Stage": "Complete stacking training (excluding tuning)",
+        "Seconds": STACK_TRAINING_SECONDS
+    }
+])
+
+timing_details.to_csv(
+    TABLE_DIR / "SOIC__temporal_timing_breakdown.csv",
+    index=False
+)
+
+# =====================================================================
+# 14. COMPLETION AND FILE VERIFICATION
+# =====================================================================
+
+print("\n" + "=" * 70)
+print("EXPERIMENT COMPLETED SUCCESSFULLY")
+print("=" * 70)
+
+print("\nGenerated CSV files:")
+
+for path in [
+    TEMPORAL_FILE,
+    COST_FILE,
+    TABLE_DIR / "SOIC__temporal_selected_hyperparameters.csv",
+    TABLE_DIR / "SOIC__temporal_timing_breakdown.csv"
+]:
+    print(
+        f"{'[OK]' if path.exists() else '[MISSING]'} "
+        f"{path}"
+    )
+
+print("\nHardware information:")
+print("Platform:", platform.platform())
+print("TensorFlow:", tf.__version__)
+print("GPU devices:", tf.config.list_physical_devices("GPU"))
+print("Training period:", f"Before {CUTOFF}")
+print("Test period:", f"{CUTOFF} onward")
+print("Inference timing repetitions:", INFERENCE_REPEATS)
+print("\nAll timing values above were obtained during execution.")

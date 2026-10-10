@@ -1,0 +1,2841 @@
+﻿
+# DATASET:
+# /kaggle/input/crop-yield-prediction-dataset/yield_df.csv
+#
+# All figures:
+#   High-resolution PNG, 400 DPI
+#   Displayed in Kaggle
+#   Saved in /kaggle/working/SOIC_FINAL/figures
+#
+# All tables:
+#   Displayed in Kaggle (large tables show first 20 rows)
+#   Saved completely as CSV
+#
+# Reviewer IDs only in filenames and index, NOT inside figures.
+#
+# IMPORTANT:
+# This is an actual full-data experiment, not a smoke test.
+# Check execution_log.csv for any failed or skipped analyses.
+# Do not claim completed experiments where the log shows failure.
+# =====================================================================
+
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_DETERMINISTIC_OPS"] = "1"
+
+import sys
+import time
+import json
+import random
+import hashlib
+import platform
+import warnings
+import traceback
+import subprocess
+import importlib.util
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from IPython.display import display, Image
+
+from sklearn.model_selection import (
+    train_test_split,
+    KFold,
+    GridSearchCV
+)
+from sklearn.preprocessing import (
+    OneHotEncoder,
+    StandardScaler,
+    MinMaxScaler
+)
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import (
+    LinearRegression,
+    Ridge
+)
+from sklearn.dummy import DummyRegressor
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score
+)
+from scipy.optimize import nnls
+from scipy.stats import wilcoxon
+
+from xgboost import XGBRegressor
+
+import tensorflow as tf
+
+if importlib.util.find_spec("keras_tuner") is None:
+    subprocess.check_call([
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "-q",
+        "keras-tuner"
+    ])
+
+import keras_tuner as kt
+
+try:
+    import shap
+    HAS_SHAP = True
+except Exception:
+    HAS_SHAP = False
+
+try:
+    from catboost import CatBoostRegressor
+    HAS_CATBOOST = True
+except Exception:
+    HAS_CATBOOST = False
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except Exception:
+    HAS_PSUTIL = False
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# =====================================================================
+# 1. FINAL EXPERIMENT CONFIGURATION
+# =====================================================================
+
+SEED = 42
+
+DATA_PATH = (
+    "/kaggle/input/crop-yield-prediction-dataset/yield_df.csv"
+)
+
+OUT = Path("/kaggle/working/SOIC_FINAL")
+FIG_DIR = OUT / "figures"
+TABLE_DIR = OUT / "tables"
+META_DIR = OUT / "metadata"
+
+for folder in [FIG_DIR, TABLE_DIR, META_DIR]:
+    folder.mkdir(parents=True, exist_ok=True)
+
+CFG = {
+    "seed": 42,
+    "test_size": 0.20,
+    "nn_max_epochs": 100,
+    "nn_trials": 10,
+    "nn_patience": 12,
+    "batch_size": 32,
+    "oof_folds": 5,
+    "outer_cv_folds": 3,
+    "tree_tuning_folds": 3,
+    "bootstrap_iterations": 1000,
+    "permutation_repeats": 10,
+    "shap_background": 20,
+    "shap_explain": 25,
+    "shap_nsamples": 128,
+    "scalability_factors": [1, 2, 5, 10],
+    "figure_dpi": 400,
+    "display_figures": True,
+    "display_tables": True,
+    "table_display_rows": 20,
+    "run_outer_cv": True,
+    "run_temporal_validation": True,
+    "run_shap": True,
+    "run_scalability": True,
+    "run_attention_comparator": True,
+    "run_feature_engineering": True,
+    "run_target_scaler_comparison": True
+}
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.keras.utils.set_random_seed(SEED)
+
+try:
+    tf.config.experimental.enable_op_determinism()
+except Exception:
+    pass
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 12,
+    "axes.labelsize": 12,
+    "axes.titlesize": 13,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "savefig.dpi": CFG["figure_dpi"],
+    "figure.dpi": 120,
+    "axes.grid": False
+})
+
+ARTIFACTS = []
+EXECUTION_LOG = []
+MODEL_TIMES = []
+
+# =====================================================================
+# 2. SAVE + DISPLAY HELPERS
+# =====================================================================
+
+def log(stage, status="OK", details=""):
+    entry = {
+        "stage": stage,
+        "status": status,
+        "details": str(details)
+    }
+    EXECUTION_LOG.append(entry)
+    print(
+        f"[{status}] {stage} — {str(details)[:180]}",
+        flush=True
+    )
+
+def save_progress():
+    pd.DataFrame(EXECUTION_LOG).to_csv(
+        OUT / "execution_log.csv",
+        index=False
+    )
+    pd.DataFrame(ARTIFACTS).to_csv(
+        OUT / "reviewer_artifact_index.csv",
+        index=False
+    )
+
+def save_table(code, filename, frame, description):
+    name = f"{code}__{filename}.csv"
+    destination = TABLE_DIR / name
+
+    frame = pd.DataFrame(frame)
+    frame.to_csv(destination, index=False)
+
+    ARTIFACTS.append({
+        "comment_ids": code,
+        "artifact_type": "table",
+        "filename": name,
+        "description": description
+    })
+
+    save_progress()
+
+    if CFG["display_tables"]:
+        print(f"\nTABLE: {description}")
+        print(f"Saved: {destination}")
+        display(
+            frame.head(
+                CFG["table_display_rows"]
+            ).round(5)
+        )
+
+    return frame
+
+def save_fig(code, filename, description):
+    name = f"{code}__{filename}.png"
+    destination = FIG_DIR / name
+
+    plt.tight_layout()
+
+    plt.savefig(
+        destination,
+        dpi=CFG["figure_dpi"],
+        bbox_inches="tight",
+        facecolor="white"
+    )
+
+    ARTIFACTS.append({
+        "comment_ids": code,
+        "artifact_type": "figure",
+        "filename": name,
+        "description": description
+    })
+
+    save_progress()
+
+    print(f"\nFIGURE: {description}")
+    print(f"Saved: {destination}")
+
+    if CFG["display_figures"]:
+        display(plt.gcf())
+
+    plt.close()
+
+def run_stage(name, function):
+    print("\n" + "=" * 68)
+    print("RUNNING:", name)
+    print("=" * 68)
+
+    try:
+        result = function()
+        log(name, "OK", "Completed")
+        save_progress()
+        return result
+    except Exception as exc:
+        log(name, "FAILED", repr(exc))
+        traceback.print_exc(limit=4)
+        save_progress()
+        return None
+
+# =====================================================================
+# 3. LOAD AND VERIFY FULL DATASET
+# RB Questions for the Authors — Q3
+# =====================================================================
+
+if not Path(DATA_PATH).is_file():
+    raise FileNotFoundError(DATA_PATH)
+
+raw = pd.read_csv(DATA_PATH)
+
+raw = raw.loc[
+    :,
+    ~raw.columns.astype(str).str.startswith("Unnamed:")
+].copy()
+
+FEATURES = [
+    "Area",
+    "Item",
+    "Year",
+    "average_rain_fall_mm_per_year",
+    "pesticides_tonnes",
+    "avg_temp"
+]
+
+TARGET = "hg/ha_yield"
+CATEGORICAL = ["Area", "Item"]
+
+NUMERICAL = [
+    c for c in FEATURES
+    if c not in CATEGORICAL
+]
+
+missing = set(FEATURES + [TARGET]) - set(raw.columns)
+
+if missing:
+    raise ValueError(
+        f"Dataset is missing: {sorted(missing)}"
+    )
+
+raw = raw[FEATURES + [TARGET]].copy()
+
+for col in NUMERICAL + [TARGET]:
+    raw[col] = pd.to_numeric(
+        raw[col],
+        errors="coerce"
+    )
+
+raw = raw.dropna().reset_index(drop=True)
+
+for col in CATEGORICAL:
+    raw[col] = raw[col].astype(str)
+
+with open(DATA_PATH, "rb") as f:
+    DATA_HASH = hashlib.sha256(f.read()).hexdigest()
+
+data = raw.copy()
+
+profile = pd.DataFrame([{
+    "Observations": len(data),
+    "Countries": data.Area.nunique(),
+    "Crops": data.Item.nunique(),
+    "First_Year": data.Year.min(),
+    "Last_Year": data.Year.max(),
+    "Target": TARGET,
+    "Units": "hg/ha",
+    "SHA256": DATA_HASH
+}])
+
+save_table(
+    "RB_Q3",
+    "dataset_profile",
+    profile,
+    "Dataset geographical and temporal coverage"
+)
+
+save_table(
+    "RB_Q3",
+    "crop_counts",
+    data.Item.value_counts().rename_axis(
+        "Crop"
+    ).reset_index(name="Observations"),
+    "Crop types and observation counts"
+)
+
+save_table(
+    "RB_Q3",
+    "country_counts",
+    data.Area.value_counts().rename_axis(
+        "Country"
+    ).reset_index(name="Observations"),
+    "Countries included in the dataset"
+)
+
+log(
+    "Dataset verification",
+    details=f"{len(data)} usable records"
+)
+
+# =====================================================================
+# 4. LEAKAGE-SAFE DATA TRANSFORMATIONS
+# RA Technical 6,8 — RB Major 4
+# =====================================================================
+
+def make_encoder():
+    try:
+        return OneHotEncoder(
+            handle_unknown="ignore",
+            sparse_output=False
+        )
+    except TypeError:
+        return OneHotEncoder(
+            handle_unknown="ignore",
+            sparse=False
+        )
+
+def make_processor(columns=FEATURES):
+    cats = [c for c in CATEGORICAL if c in columns]
+    nums = [c for c in columns if c not in cats]
+
+    return ColumnTransformer(
+        transformers=[
+            ("categorical", make_encoder(), cats),
+            ("numerical", StandardScaler(), nums)
+        ],
+        sparse_threshold=0
+    )
+
+def prepare_features(train_df, other_df, columns=FEATURES):
+    processor = make_processor(columns)
+
+    Xtrain = processor.fit_transform(
+        train_df[columns]
+    )
+    Xother = processor.transform(
+        other_df[columns]
+    )
+
+    return (
+        processor,
+        np.asarray(Xtrain, dtype=np.float32),
+        np.asarray(Xother, dtype=np.float32)
+    )
+
+def make_y_scaler(y, method="standard"):
+    scaler = (
+        StandardScaler()
+        if method == "standard"
+        else MinMaxScaler()
+    )
+
+    scaler.fit(
+        np.asarray(y).reshape(-1, 1)
+    )
+
+    return scaler
+
+def scale_target(scaler, y):
+    return scaler.transform(
+        np.asarray(y).reshape(-1, 1)
+    ).ravel()
+
+def inverse_target(scaler, y):
+    return scaler.inverse_transform(
+        np.asarray(y).reshape(-1, 1)
+    ).ravel()
+
+# =====================================================================
+# 5. REGRESSION EVALUATION
+# =====================================================================
+
+def calculate_metrics(actual, predicted):
+    actual = np.asarray(actual, dtype=float).ravel()
+    predicted = np.asarray(predicted, dtype=float).ravel()
+
+    nonzero = np.abs(actual) > 1e-10
+
+    return {
+        "MAE": mean_absolute_error(actual, predicted),
+
+        "RMSE": np.sqrt(
+            mean_squared_error(actual, predicted)
+        ),
+
+        "R2": (
+            r2_score(actual, predicted)
+            if len(actual) > 1 and np.std(actual) > 0
+            else np.nan
+        ),
+
+        "MAPE": (
+            100 * np.mean(
+                np.abs(
+                    (actual[nonzero] - predicted[nonzero])
+                    / actual[nonzero]
+                )
+            )
+            if nonzero.any()
+            else np.nan
+        ),
+
+        "sMAPE": 100 * np.mean(
+            2 * np.abs(actual - predicted) /
+            np.maximum(
+                np.abs(actual) + np.abs(predicted),
+                1e-10
+            )
+        )
+    }
+
+# =====================================================================
+# 6. MODEL CONSTRUCTORS
+# =====================================================================
+
+def create_rf(hp):
+    return RandomForestRegressor(
+        random_state=SEED,
+        n_jobs=2,
+        **hp
+    )
+
+def create_xgb(hp):
+    return XGBRegressor(
+        random_state=SEED,
+        n_jobs=2,
+        tree_method="hist",
+        objective="reg:squarederror",
+        **hp
+    )
+
+# =====================================================================
+# 7. NEURAL NETWORK ARCHITECTURE
+# RA Technical 1,5,7 — RB Major 3 — RB Q4
+# =====================================================================
+
+def build_nn(input_dim, hp):
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(
+            shape=(input_dim,)
+        )
+    ])
+
+    for i in range(int(hp["num_layers"])):
+
+        model.add(
+            tf.keras.layers.Dense(
+                units=int(hp[f"units_{i}"]),
+                activation="relu"
+            )
+        )
+
+        model.add(
+            tf.keras.layers.BatchNormalization()
+        )
+
+        model.add(
+            tf.keras.layers.Dropout(
+                float(hp[f"dropout_{i}"])
+            )
+        )
+
+    model.add(tf.keras.layers.Dense(1))
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(
+            learning_rate=float(hp["learning_rate"])
+        ),
+        loss="mse",
+        metrics=["mae"]
+    )
+
+    return model
+
+def fit_nn(X, y, hp, seed=SEED, validation=None):
+    tf.keras.backend.clear_session()
+    tf.keras.utils.set_random_seed(seed)
+
+    model = build_nn(X.shape[1], hp)
+
+    arguments = {
+        "x": np.asarray(X, dtype=np.float32),
+        "y": np.asarray(y, dtype=np.float32),
+        "epochs": CFG["nn_max_epochs"],
+        "batch_size": CFG["batch_size"],
+        "verbose": 0
+    }
+
+    if validation is not None:
+        arguments["validation_data"] = validation
+        arguments["callbacks"] = [
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_loss",
+                patience=CFG["nn_patience"],
+                restore_best_weights=True
+            )
+        ]
+
+    start = time.perf_counter()
+    history = model.fit(**arguments).history
+    elapsed = time.perf_counter() - start
+
+    return model, history, elapsed
+
+def predict_nn(model, X):
+    return model.predict(
+        np.asarray(X, dtype=np.float32),
+        verbose=0
+    ).ravel()
+
+# =====================================================================
+# 8. TRAINING-ONLY HYPERPARAMETER SEARCH
+# =====================================================================
+
+def tune_tree(name, train_df):
+
+    if name == "RF":
+
+        estimator = RandomForestRegressor(
+            random_state=SEED,
+            n_jobs=2
+        )
+
+        grid = {
+            "model__n_estimators": [100, 200],
+            "model__max_depth": [10, 20, None],
+            "model__max_features": ["sqrt", "log2"]
+        }
+
+    else:
+
+        estimator = XGBRegressor(
+            random_state=SEED,
+            n_jobs=2,
+            tree_method="hist",
+            objective="reg:squarederror"
+        )
+
+        grid = {
+            "model__n_estimators": [100, 200],
+            "model__max_depth": [3, 6],
+            "model__learning_rate": [0.01, 0.1],
+            "model__subsample": [0.8, 1.0],
+            "model__colsample_bytree": [0.8, 1.0]
+        }
+
+    pipe = Pipeline([
+        ("processor", make_processor()),
+        ("model", estimator)
+    ])
+
+    search = GridSearchCV(
+        pipe,
+        grid,
+        cv=KFold(
+            n_splits=CFG["tree_tuning_folds"],
+            shuffle=True,
+            random_state=SEED
+        ),
+        scoring="neg_mean_absolute_error",
+        n_jobs=1,
+        refit=True
+    )
+
+    start = time.perf_counter()
+
+    search.fit(
+        train_df[FEATURES],
+        train_df[TARGET]
+    )
+
+    elapsed = time.perf_counter() - start
+
+    best = {
+        key.replace("model__", ""): value
+        for key, value in search.best_params_.items()
+    }
+
+    return best, elapsed
+
+def tune_nn(train_df, run_name="main"):
+
+    # Separate validation BEFORE fitting preprocessing.
+    dev, valid = train_test_split(
+        train_df,
+        test_size=0.15,
+        random_state=SEED
+    )
+
+    _, Xa, Xv = prepare_features(dev, valid)
+
+    scaler = make_y_scaler(
+        dev[TARGET],
+        "standard"
+    )
+
+    ya = scale_target(scaler, dev[TARGET])
+    yv = scale_target(scaler, valid[TARGET])
+
+    def builder(hp):
+
+        count = hp.Int(
+            "num_layers", 1, 3
+        )
+
+        parameters = {
+            "num_layers": count,
+            "learning_rate": hp.Float(
+                "learning_rate",
+                1e-4,
+                1e-2,
+                sampling="log"
+            )
+        }
+
+        for i in range(count):
+
+            parameters[f"units_{i}"] = hp.Int(
+                f"units_{i}",
+                min_value=32,
+                max_value=256,
+                step=32
+            )
+
+            parameters[f"dropout_{i}"] = hp.Float(
+                f"dropout_{i}",
+                min_value=0.2,
+                max_value=0.5,
+                step=0.1
+            )
+
+        return build_nn(
+            Xa.shape[1],
+            parameters
+        )
+
+    tuner = kt.RandomSearch(
+        builder,
+        objective="val_mae",
+        max_trials=CFG["nn_trials"],
+        seed=SEED,
+        executions_per_trial=1,
+        directory=str(META_DIR / "keras_tuner"),
+        project_name=run_name,
+        overwrite=True
+    )
+
+    start = time.perf_counter()
+
+    tuner.search(
+        Xa,
+        ya,
+        validation_data=(Xv, yv),
+        epochs=CFG["nn_max_epochs"],
+        batch_size=CFG["batch_size"],
+        callbacks=[
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_loss",
+                patience=CFG["nn_patience"],
+                restore_best_weights=True
+            )
+        ],
+        verbose=0
+    )
+
+    elapsed = time.perf_counter() - start
+
+    chosen = tuner.get_best_hyperparameters(1)[0].values
+
+    hp = {
+        "num_layers": int(chosen["num_layers"]),
+        "learning_rate": float(
+            chosen["learning_rate"]
+        )
+    }
+
+    for i in range(hp["num_layers"]):
+        hp[f"units_{i}"] = int(
+            chosen[f"units_{i}"]
+        )
+        hp[f"dropout_{i}"] = float(
+            chosen[f"dropout_{i}"]
+        )
+
+    return hp, elapsed
+
+# =====================================================================
+# 9. BASE MODEL FITTING
+# =====================================================================
+
+def fit_base(name, X, y, hp, seed=SEED):
+
+    if name == "RF":
+        model = create_rf(hp["RF"])
+        model.fit(X, y)
+        return model
+
+    if name == "XGBoost":
+        model = create_xgb(hp["XGBoost"])
+        model.fit(X, y)
+        return model
+
+    if name == "NN":
+        model, _, _ = fit_nn(
+            X, y, hp["NN"], seed=seed
+        )
+        return model
+
+    if name == "Linear":
+        model = LinearRegression()
+        model.fit(X, y)
+        return model
+
+    if name == "Dummy":
+        model = DummyRegressor(strategy="mean")
+        model.fit(X, y)
+        return model
+
+    raise ValueError(name)
+
+def predict_base(name, model, X):
+    if name == "NN":
+        return predict_nn(model, X)
+
+    return model.predict(X)
+
+# =====================================================================
+# 10. TRAINING / TEST SPLIT
+# =====================================================================
+
+stratify = (
+    data.Item
+    if data.Item.value_counts().min() >= 2
+    else None
+)
+
+TRAIN, TEST = train_test_split(
+    data,
+    test_size=CFG["test_size"],
+    random_state=SEED,
+    stratify=stratify
+)
+
+TRAIN = TRAIN.reset_index(drop=True)
+TEST = TEST.reset_index(drop=True)
+
+Y_TEST = TEST[TARGET].to_numpy()
+
+log(
+    "Main split",
+    details=f"Train={len(TRAIN)}; Test={len(TEST)}"
+)
+
+# =====================================================================
+# 11. MAIN HYPERPARAMETER OPTIMIZATION
+# =====================================================================
+
+print("\nOptimizing Random Forest...")
+RF_HP, RF_SEARCH_SECONDS = tune_tree(
+    "RF", TRAIN
+)
+
+print("\nOptimizing XGBoost...")
+XGB_HP, XGB_SEARCH_SECONDS = tune_tree(
+    "XGBoost", TRAIN
+)
+
+print("\nOptimizing Neural Network...")
+NN_HP, NN_SEARCH_SECONDS = tune_nn(
+    TRAIN, "main"
+)
+
+HP = {
+    "RF": RF_HP,
+    "XGBoost": XGB_HP,
+    "NN": NN_HP
+}
+
+save_table(
+    "RA_T1_RA_RP2_RB_Q4",
+    "hyperparameter_optimization",
+    pd.DataFrame([
+        {
+            "Model": "RF",
+            "Search_Seconds": RF_SEARCH_SECONDS,
+            "Selected": json.dumps(RF_HP)
+        },
+        {
+            "Model": "XGBoost",
+            "Search_Seconds": XGB_SEARCH_SECONDS,
+            "Selected": json.dumps(XGB_HP)
+        },
+        {
+            "Model": "NN",
+            "Search_Seconds": NN_SEARCH_SECONDS,
+            "Selected": json.dumps(NN_HP)
+        }
+    ]),
+    "Optimization time and selected hyperparameters"
+)
+
+(META_DIR / "selected_hyperparameters.json").write_text(
+    json.dumps(HP, indent=2)
+)
+
+log("Hyperparameter optimization", details="Completed")
+
+# =====================================================================
+# 12. CORRECT OOF STACKING
+# RA Methodology 3/4 — RB Questions 1/2
+# =====================================================================
+
+BASE = ["RF", "XGBoost", "NN"]
+
+def run_stacking(
+    train_df,
+    test_df,
+    hp,
+    target_scaling="standard",
+    include_linear=True,
+    save_nn_history=False,
+    oof_folds=None
+):
+
+    names = BASE.copy()
+
+    if include_linear:
+        names.append("Linear")
+
+    y = train_df[TARGET].to_numpy()
+
+    folds = KFold(
+        n_splits=oof_folds or CFG["oof_folds"],
+        shuffle=True,
+        random_state=SEED
+    )
+
+    OOF = np.full(
+        (len(train_df), len(names)),
+        np.nan
+    )
+
+    # Preprocessing and target scaling are fitted separately
+    # within every OOF training fold.
+
+    oof_start = time.perf_counter()
+
+    for fold_number, (a, b) in enumerate(
+        folds.split(train_df)
+    ):
+
+        df_a = train_df.iloc[a]
+        df_b = train_df.iloc[b]
+
+        _, Xa, Xb = prepare_features(df_a, df_b)
+
+        scaler = make_y_scaler(
+            df_a[TARGET],
+            target_scaling
+        )
+
+        ya = scale_target(
+            scaler,
+            df_a[TARGET]
+        )
+
+        for j, name in enumerate(names):
+
+            model = fit_base(
+                name,
+                Xa,
+                ya,
+                hp,
+                seed=SEED + fold_number
+            )
+
+            OOF[b, j] = inverse_target(
+                scaler,
+                predict_base(name, model, Xb)
+            )
+
+    if not np.isfinite(OOF).all():
+        raise RuntimeError("Invalid OOF predictions")
+
+    oof_seconds = time.perf_counter() - oof_start
+
+    Z = OOF[:, :3]
+
+    # Ridge alpha selection uses ONLY training OOF predictions.
+    alpha_options = [
+        0.001, 0.01, 0.1, 1, 10, 100
+    ]
+
+    meta_cv = KFold(
+        n_splits=5,
+        shuffle=True,
+        random_state=SEED
+    )
+
+    sensitivity = []
+
+    for alpha in alpha_options:
+
+        fold_scores = []
+
+        for a, b in meta_cv.split(Z):
+            model = Ridge(alpha=alpha)
+            model.fit(Z[a], y[a])
+
+            fold_scores.append(
+                mean_absolute_error(
+                    y[b],
+                    model.predict(Z[b])
+                )
+            )
+
+        sensitivity.append({
+            "Alpha": alpha,
+            "Training_Meta_CV_MAE": np.mean(fold_scores)
+        })
+
+    selected_alpha = min(
+        sensitivity,
+        key=lambda row: row["Training_Meta_CV_MAE"]
+    )["Alpha"]
+
+    ridge = Ridge(alpha=selected_alpha)
+    ridge.fit(Z, y)
+
+    # NNLS: no intercept, nonnegative weights,
+    # no sum-to-one constraint.
+
+    nnls_weights, _ = nnls(Z, y)
+
+    # Fit preprocessing and base models on the complete
+    # training portion, never on the evaluation set.
+
+    processor, Xfull, Xtest = prepare_features(
+        train_df, test_df
+    )
+
+    final_scaler = make_y_scaler(
+        y,
+        target_scaling
+    )
+
+    scaled_y = scale_target(
+        final_scaler, y
+    )
+
+    models = {}
+    predictions = {}
+    fit_times = []
+    nn_history = None
+
+    for name in names:
+
+        start = time.perf_counter()
+
+        if name == "NN" and save_nn_history:
+
+            sub_a, sub_b = train_test_split(
+                np.arange(len(train_df)),
+                test_size=0.15,
+                random_state=SEED
+            )
+
+            # Diagnostic learning curve:
+            # Fit its feature/target transformations on
+            # diagnostic training observations only.
+
+            diag_train = train_df.iloc[sub_a]
+            diag_valid = train_df.iloc[sub_b]
+
+            _, Xdiag, Xdiag_valid = prepare_features(
+                diag_train, diag_valid
+            )
+
+            diag_scaler = make_y_scaler(
+                diag_train[TARGET],
+                target_scaling
+            )
+
+            ydiag = scale_target(
+                diag_scaler,
+                diag_train[TARGET]
+            )
+
+            ydiag_valid = scale_target(
+                diag_scaler,
+                diag_valid[TARGET]
+            )
+
+            _, nn_history, _ = fit_nn(
+                Xdiag,
+                ydiag,
+                hp["NN"],
+                validation=(
+                    Xdiag_valid,
+                    ydiag_valid
+                )
+            )
+
+        model = fit_base(
+            name,
+            Xfull,
+            scaled_y,
+            hp
+        )
+
+        seconds = time.perf_counter() - start
+
+        fit_times.append({
+            "Model": name,
+            "Training_Seconds": seconds,
+            "Training_Rows": len(train_df)
+        })
+
+        models[name] = model
+
+        predictions[name] = inverse_target(
+            final_scaler,
+            predict_base(name, model, Xtest)
+        )
+
+    Ztest = np.column_stack([
+        predictions[name] for name in BASE
+    ])
+
+    predictions["Stack_Ridge"] = ridge.predict(Ztest)
+    predictions["Stack_Mean"] = Ztest.mean(axis=1)
+    predictions["Stack_NNLS"] = (
+        Ztest @ nnls_weights
+    )
+
+    # Base-learner ablations.
+
+    for removed in BASE:
+
+        columns = [
+            i for i, name in enumerate(BASE)
+            if name != removed
+        ]
+
+        reduced = Ridge(alpha=selected_alpha)
+        reduced.fit(
+            Z[:, columns],
+            y
+        )
+
+        predictions["Without_" + removed] = (
+            reduced.predict(Ztest[:, columns])
+        )
+
+    # Linear learner as an alternative stacking input.
+
+    if include_linear:
+
+        linear_instead = Ridge(
+            alpha=selected_alpha
+        )
+
+        linear_instead.fit(
+            OOF[:, [0, 1, 3]],
+            y
+        )
+
+        predictions["Stack_LinearInsteadNN"] = (
+            linear_instead.predict(
+                np.column_stack([
+                    Ztest[:, 0],
+                    Ztest[:, 1],
+                    predictions["Linear"]
+                ])
+            )
+        )
+
+        four_model = Ridge(alpha=selected_alpha)
+        four_model.fit(OOF, y)
+
+        predictions["Stack_WithLinear"] = (
+            four_model.predict(
+                np.column_stack([
+                    Ztest,
+                    predictions["Linear"]
+                ])
+            )
+        )
+
+    def predict_ensemble(raw_frame):
+
+        X = np.asarray(
+            processor.transform(raw_frame[FEATURES]),
+            dtype=np.float32
+        )
+
+        columns = []
+
+        for name in BASE:
+
+            predicted = predict_base(
+                name, models[name], X
+            )
+
+            columns.append(
+                inverse_target(
+                    final_scaler,
+                    predicted
+                )
+            )
+
+        return ridge.predict(
+            np.column_stack(columns)
+        )
+
+    return {
+        "predictions": predictions,
+        "models": models,
+        "processor": processor,
+        "target_scaler": final_scaler,
+        "ridge": ridge,
+        "selected_alpha": selected_alpha,
+        "alpha_table": pd.DataFrame(sensitivity),
+        "nnls_weights": nnls_weights,
+        "oof_seconds": oof_seconds,
+        "fit_times": pd.DataFrame(fit_times),
+        "nn_history": nn_history,
+        "predict": predict_ensemble
+    }
+
+# =====================================================================
+# 13. MAIN HELD-OUT MODEL EVALUATION
+# =====================================================================
+
+MAIN = run_stacking(
+    TRAIN,
+    TEST,
+    HP,
+    include_linear=True,
+    save_nn_history=True
+)
+
+PRED = MAIN["predictions"]
+
+comparison = pd.DataFrame([
+    {
+        "Model": name,
+        **calculate_metrics(Y_TEST, pred)
+    }
+    for name, pred in PRED.items()
+])
+
+save_table(
+    "RA_M3_RA_M7_RB_Q1_RB_Q2",
+    "full_model_comparison",
+    comparison,
+    "Held-out standalone and stacking model performance"
+)
+
+save_table(
+    "RA_M4_RB_Q2",
+    "ridge_alpha_sensitivity",
+    MAIN["alpha_table"],
+    "Ridge regularization sensitivity"
+)
+
+save_table(
+    "RA_T3_RB_M1",
+    "model_fit_times",
+    MAIN["fit_times"],
+    "Base-model training time excluding tuning"
+)
+
+# =====================================================================
+# 14. NN LEARNING CURVES
+# =====================================================================
+
+def learning_curves():
+
+    history = MAIN["nn_history"]
+
+    if not history:
+        raise RuntimeError("NN history unavailable")
+
+    frame = pd.DataFrame(history)
+    frame.insert(
+        0,
+        "Epoch",
+        range(1, len(frame) + 1)
+    )
+
+    save_table(
+        "RA_T7_RB_M3",
+        "nn_training_history",
+        frame,
+        "Epoch-wise training and validation results"
+    )
+
+    for training, validation, label in [
+        ("loss", "val_loss", "MSE"),
+        ("mae", "val_mae", "MAE")
+    ]:
+
+        plt.figure(figsize=(9, 5.5))
+
+        plt.plot(
+            frame.Epoch,
+            frame[training],
+            linewidth=2,
+            label="Training"
+        )
+
+        plt.plot(
+            frame.Epoch,
+            frame[validation],
+            linewidth=2,
+            label="Validation"
+        )
+
+        plt.xlabel("Epoch")
+        plt.ylabel(
+            f"{label} (normalized target)"
+        )
+        plt.title(
+            f"Neural Network Training and Validation {label}"
+        )
+        plt.legend()
+        plt.grid(alpha=0.2)
+
+        save_fig(
+            "RA_T7_RB_M3",
+            f"nn_learning_curve_{label.lower()}",
+            f"Neural Network {label} learning curves"
+        )
+
+run_stage("NN learning curves", learning_curves)
+
+# =====================================================================
+# 15. ACTUAL VERSUS PREDICTED FIGURES
+# =====================================================================
+
+def actual_vs_predicted():
+
+    for name in BASE + ["Stack_Ridge"]:
+
+        ypred = PRED[name]
+
+        plt.figure(figsize=(7.5, 6))
+
+        plt.scatter(
+            Y_TEST,
+            ypred,
+            s=14,
+            alpha=0.55
+        )
+
+        low = min(
+            np.min(Y_TEST),
+            np.min(ypred)
+        )
+        high = max(
+            np.max(Y_TEST),
+            np.max(ypred)
+        )
+
+        plt.plot(
+            [low, high],
+            [low, high],
+            linestyle="--",
+            linewidth=1.4,
+            color="black",
+            label="Ideal prediction"
+        )
+
+        plt.xlabel("Actual Crop Yield (hg/ha)")
+        plt.ylabel("Predicted Crop Yield (hg/ha)")
+        plt.title(f"{name}: Actual vs Predicted")
+        plt.legend()
+
+        save_fig(
+            "RA_R5_RB_M5",
+            f"{name.lower()}_actual_vs_predicted",
+            "Actual versus predicted crop yield"
+        )
+
+run_stage(
+    "Actual versus predicted figures",
+    actual_vs_predicted
+)
+
+# =====================================================================
+# 16. RESIDUAL AND RELATIVE ERROR FIGURES
+# =====================================================================
+
+def error_figures():
+
+    for name in BASE + ["Stack_Ridge"]:
+
+        ypred = PRED[name]
+        residuals = Y_TEST - ypred
+
+        relative = (
+            100 * np.abs(residuals) /
+            np.maximum(np.abs(Y_TEST), 1.0)
+        )
+
+        save_table(
+            "RA_R4_RB_M5",
+            f"{name.lower()}_errors",
+            pd.DataFrame({
+                "Actual": Y_TEST,
+                "Predicted": ypred,
+                "Residual": residuals,
+                "Absolute_Error": np.abs(residuals),
+                "Relative_Error_Percent": relative
+            }),
+            f"{name} residual and relative error data"
+        )
+
+        plt.figure(figsize=(9, 5.5))
+
+        plt.scatter(
+            Y_TEST,
+            residuals,
+            s=13,
+            alpha=0.55
+        )
+
+        plt.axhline(
+            0,
+            color="black",
+            linewidth=1
+        )
+
+        plt.xlabel("Actual Crop Yield (hg/ha)")
+        plt.ylabel("Residual (hg/ha)")
+        plt.title(f"{name}: Residual Distribution")
+
+        save_fig(
+            "RA_R4_RB_M5",
+            f"{name.lower()}_residuals",
+            f"{name} residual plot"
+        )
+
+        plt.figure(figsize=(9, 5.5))
+
+        plt.scatter(
+            Y_TEST,
+            relative,
+            s=13,
+            alpha=0.55
+        )
+
+        plt.xlabel("Actual Crop Yield (hg/ha)")
+        plt.ylabel("Absolute Relative Error (%)")
+        plt.title(
+            f"{name}: Relative Prediction Error"
+        )
+
+        save_fig(
+            "RA_R4_RB_M5",
+            f"{name.lower()}_relative_error",
+            f"{name} relative prediction error"
+        )
+
+run_stage("Error visualizations", error_figures)
+
+# =====================================================================
+# 17. BOOTSTRAP CONFIDENCE INTERVALS
+# RA Results 1 — Technical 4
+# =====================================================================
+
+def bootstrap_analysis():
+
+    rng = np.random.default_rng(SEED)
+    records = []
+
+    selected_models = [
+        "RF", "XGBoost", "NN", "Stack_Ridge"
+    ]
+
+    for iteration in range(
+        CFG["bootstrap_iterations"]
+    ):
+
+        sample = rng.integers(
+            0,
+            len(Y_TEST),
+            len(Y_TEST)
+        )
+
+        for name in selected_models:
+
+            m = calculate_metrics(
+                Y_TEST[sample],
+                PRED[name][sample]
+            )
+
+            records.append({
+                "Iteration": iteration,
+                "Model": name,
+                "MAE": m["MAE"],
+                "RMSE": m["RMSE"],
+                "R2": m["R2"]
+            })
+
+    boot = pd.DataFrame(records)
+    intervals = []
+
+    for name, group in boot.groupby("Model"):
+
+        result = {"Model": name}
+
+        for metric in ["MAE", "RMSE", "R2"]:
+
+            result[f"{metric}_Lower95"] = (
+                group[metric].quantile(0.025)
+            )
+
+            result[f"{metric}_Upper95"] = (
+                group[metric].quantile(0.975)
+            )
+
+        intervals.append(result)
+
+    save_table(
+        "RA_R1_RA_T4",
+        "bootstrap_95CI",
+        pd.DataFrame(intervals),
+        "Bootstrap 95% performance intervals"
+    )
+
+    pairs = []
+
+    for iteration, group in boot.groupby("Iteration"):
+
+        z = group.set_index("Model")
+
+        pairs.append({
+            "Iteration": iteration,
+            "MAE_XGBoost_minus_Stack": (
+                z.loc["XGBoost", "MAE"]
+                - z.loc["Stack_Ridge", "MAE"]
+            ),
+            "RMSE_XGBoost_minus_Stack": (
+                z.loc["XGBoost", "RMSE"]
+                - z.loc["Stack_Ridge", "RMSE"]
+            )
+        })
+
+    differences = pd.DataFrame(pairs)
+
+    save_table(
+        "RA_R1_RA_T4",
+        "paired_bootstrap_differences",
+        differences,
+        "Paired bootstrap model comparison"
+    )
+
+    for metric in [
+        "MAE_XGBoost_minus_Stack",
+        "RMSE_XGBoost_minus_Stack"
+    ]:
+
+        plt.figure(figsize=(8, 5))
+
+        plt.hist(
+            differences[metric],
+            bins=35,
+            edgecolor="black",
+            linewidth=0.4
+        )
+
+        plt.axvline(
+            0,
+            linestyle="--",
+            color="black"
+        )
+
+        plt.xlabel(
+            "Difference (XGBoost − Stacking)"
+        )
+        plt.ylabel("Bootstrap Frequency")
+        plt.title(
+            metric.replace("_", " ")
+        )
+
+        save_fig(
+            "RA_R1_RA_T4",
+            metric.lower(),
+            "Paired bootstrap performance differences"
+        )
+
+run_stage(
+    "Bootstrap confidence intervals",
+    bootstrap_analysis
+)
+
+# =====================================================================
+# 18. ERROR ANALYSIS BY CROP, COUNTRY, YIELD GROUP
+# =====================================================================
+
+def stratified_analysis():
+
+    df = TEST.copy()
+
+    lower, upper = np.quantile(
+        TRAIN[TARGET],
+        [1/3, 2/3]
+    )
+
+    df["Yield_Group"] = pd.cut(
+        df[TARGET],
+        [-np.inf, lower, upper, np.inf],
+        labels=["Low", "Medium", "High"]
+    )
+
+    results = []
+
+    for feature in [
+        "Item", "Area", "Yield_Group"
+    ]:
+
+        for value, indices in df.groupby(
+            feature,
+            observed=True
+        ).indices.items():
+
+            if len(indices) < 20:
+                continue
+
+            for model in ["XGBoost", "Stack_Ridge"]:
+
+                m = calculate_metrics(
+                    Y_TEST[indices],
+                    PRED[model][indices]
+                )
+
+                results.append({
+                    "Feature": feature,
+                    "Category": str(value),
+                    "Count": len(indices),
+                    "Model": model,
+                    **m
+                })
+
+    frame = pd.DataFrame(results)
+
+    save_table(
+        "RA_R4_RA_M6",
+        "stratified_model_errors",
+        frame,
+        "Errors by crop, country and crop yield range"
+    )
+
+    # Plot crop-level MAE for categories with enough samples.
+
+    crop_data = frame[
+        frame.Feature == "Item"
+    ]
+
+    if not crop_data.empty:
+
+        pivot = crop_data.pivot(
+            index="Category",
+            columns="Model",
+            values="MAE"
+        )
+
+        pivot.plot(
+            kind="bar",
+            figsize=(11, 6)
+        )
+
+        plt.ylabel("MAE (hg/ha)")
+        plt.xlabel("Crop Type")
+        plt.title("Crop-Specific Prediction Error")
+        plt.xticks(rotation=45, ha="right")
+        plt.legend(title="Model")
+
+        save_fig(
+            "RA_R4_RA_M6",
+            "crop_specific_mae",
+            "Crop-specific model error comparison"
+        )
+
+run_stage("Stratified error analysis", stratified_analysis)
+
+# =====================================================================
+# 19. ENVIRONMENTAL FAILURE-CASE ANALYSIS
+# =====================================================================
+
+def environmental_analysis():
+
+    rows = []
+
+    for feature in [
+        "average_rain_fall_mm_per_year",
+        "avg_temp"
+    ]:
+
+        low, high = np.quantile(
+            TRAIN[feature],
+            [0.10, 0.90]
+        )
+
+        for label, mask in [
+            ("Low", TEST[feature] <= low),
+            ("High", TEST[feature] >= high)
+        ]:
+
+            idx = np.flatnonzero(
+                mask.to_numpy()
+            )
+
+            if len(idx) < 20:
+                continue
+
+            for name in ["XGBoost", "Stack_Ridge"]:
+
+                rows.append({
+                    "Feature": feature,
+                    "Group": label,
+                    "Count": len(idx),
+                    "Model": name,
+                    **calculate_metrics(
+                        Y_TEST[idx],
+                        PRED[name][idx]
+                    )
+                })
+
+    save_table(
+        "RA_M6_RB_M2",
+        "environmental_error_subsets",
+        pd.DataFrame(rows),
+        "Low/high annual weather feature subsets"
+    )
+
+run_stage(
+    "Environmental failure-case analysis",
+    environmental_analysis
+)
+
+# =====================================================================
+# 20. FEATURE IMPORTANCE — CORRECTED IMPLEMENTATION
+# RA Results 7 — RB Major 2
+# =====================================================================
+
+def feature_importance():
+
+    rows = []
+    processor = MAIN["processor"]
+    scaler = MAIN["target_scaler"]
+    rng = np.random.default_rng(SEED)
+
+    for model_name in ["RF", "XGBoost"]:
+
+        model = MAIN["models"][model_name]
+
+        def predict_raw(frame):
+
+            X = processor.transform(
+                frame[FEATURES]
+            )
+
+            X = np.asarray(X, dtype=np.float32)
+
+            return inverse_target(
+                scaler,
+                model.predict(X)
+            )
+
+        baseline = mean_absolute_error(
+            Y_TEST,
+            predict_raw(TEST)
+        )
+
+        for feature in FEATURES:
+
+            increases = []
+
+            for repeat in range(
+                CFG["permutation_repeats"]
+            ):
+
+                shuffled = TEST[FEATURES].copy()
+
+                shuffled[feature] = rng.permutation(
+                    shuffled[feature].to_numpy()
+                )
+
+                error = mean_absolute_error(
+                    Y_TEST,
+                    predict_raw(shuffled)
+                )
+
+                increases.append(
+                    error - baseline
+                )
+
+            rows.append({
+                "Model": model_name,
+                "Feature": feature,
+                "Mean_Importance": np.mean(increases),
+                "Std_Importance": np.std(increases),
+                "Baseline_MAE": baseline
+            })
+
+    result = pd.DataFrame(rows)
+
+    save_table(
+        "RA_R7_RB_M2",
+        "permutation_importance",
+        result,
+        "RF and XGBoost raw-feature permutation importance"
+    )
+
+    for name in ["RF", "XGBoost"]:
+
+        subset = result[
+            result.Model == name
+        ].sort_values("Mean_Importance")
+
+        plt.figure(figsize=(10, 6))
+
+        plt.barh(
+            subset.Feature,
+            subset.Mean_Importance,
+            xerr=subset.Std_Importance,
+            capsize=3
+        )
+
+        plt.axvline(
+            0,
+            color="black",
+            linewidth=0.8
+        )
+
+        plt.xlabel(
+            "Increase in MAE After Permutation (hg/ha)"
+        )
+        plt.title(
+            f"{name} Feature Importance"
+        )
+
+        save_fig(
+            "RA_R7_RB_M2",
+            f"{name.lower()}_feature_importance",
+            f"{name} permutation feature importance"
+        )
+
+run_stage(
+    "RF and XGBoost feature importance",
+    feature_importance
+)
+
+# =====================================================================
+# 21. ENSEMBLE SHAP
+# RA Originality 4/5 — RB Major 2
+# =====================================================================
+
+def ensemble_shap():
+
+    if not HAS_SHAP:
+        raise RuntimeError(
+            "SHAP is not installed"
+        )
+
+    background = TRAIN[FEATURES].sample(
+        CFG["shap_background"],
+        random_state=SEED
+    )
+
+    explain = TEST[FEATURES].sample(
+        CFG["shap_explain"],
+        random_state=SEED
+    )
+
+    categories = {
+        c: sorted(data[c].unique().tolist())
+        for c in CATEGORICAL
+    }
+
+    def encode(df):
+
+        result = df[FEATURES].copy()
+
+        for c in CATEGORICAL:
+            result[c] = pd.Categorical(
+                result[c],
+                categories=categories[c]
+            ).codes
+
+        return result.astype(float).to_numpy()
+
+    def decode(array):
+
+        df = pd.DataFrame(
+            array,
+            columns=FEATURES
+        )
+
+        for c in CATEGORICAL:
+
+            idx = np.clip(
+                np.rint(df[c]).astype(int),
+                0,
+                len(categories[c]) - 1
+            )
+
+            df[c] = np.asarray(
+                categories[c],
+                dtype=object
+            )[idx]
+
+        return df
+
+    explainer = shap.KernelExplainer(
+        lambda x: MAIN["predict"](decode(x)),
+        encode(background)
+    )
+
+    shap_values = np.asarray(
+        explainer.shap_values(
+            encode(explain),
+            nsamples=CFG["shap_nsamples"]
+        )
+    )
+
+    if shap_values.ndim == 3:
+        shap_values = shap_values[:, :, 0]
+
+    importance = pd.DataFrame({
+        "Feature": FEATURES,
+        "Mean_Absolute_SHAP": np.mean(
+            np.abs(shap_values),
+            axis=0
+        )
+    })
+
+    save_table(
+        "RA_O4_RA_O5_RB_M2",
+        "ensemble_shap_values",
+        importance,
+        "Approximate ensemble-level SHAP attribution"
+    )
+
+    result = importance.sort_values(
+        "Mean_Absolute_SHAP"
+    )
+
+    plt.figure(figsize=(10, 6))
+
+    plt.barh(
+        result.Feature,
+        result.Mean_Absolute_SHAP
+    )
+
+    plt.xlabel(
+        "Mean Absolute SHAP Value (hg/ha)"
+    )
+    plt.title(
+        "Stacking Ensemble Feature Importance"
+    )
+
+    save_fig(
+        "RA_O4_RA_O5_RB_M2",
+        "ensemble_shap_importance",
+        "Approximate ensemble SHAP importance"
+    )
+
+if CFG["run_shap"]:
+    run_stage("Ensemble SHAP", ensemble_shap)
+
+# =====================================================================
+# 22. TARGET SCALING COMPARISON
+# =====================================================================
+
+def scaling_comparison():
+
+    a, b = train_test_split(
+        TRAIN,
+        test_size=0.20,
+        random_state=SEED
+    )
+
+    _, Xa, Xb = prepare_features(a, b)
+    rows = []
+
+    for method in ["standard", "minmax"]:
+
+        scaler = make_y_scaler(
+            a[TARGET],
+            method
+        )
+
+        ya = scale_target(
+            scaler,
+            a[TARGET]
+        )
+
+        nn_model, _, _ = fit_nn(
+            Xa,
+            ya,
+            NN_HP
+        )
+
+        predicted = inverse_target(
+            scaler,
+            predict_nn(nn_model, Xb)
+        )
+
+        rows.append({
+            "Target_Scaling": method,
+            **calculate_metrics(
+                b[TARGET],
+                predicted
+            )
+        })
+
+    save_table(
+        "RA_M8_RA_T8",
+        "target_scaling_comparison",
+        pd.DataFrame(rows),
+        "NN target scaling validation comparison"
+    )
+
+if CFG["run_target_scaler_comparison"]:
+    run_stage(
+        "Target scaling comparison",
+        scaling_comparison
+    )
+
+# =====================================================================
+# 23. ADDITIONAL AGRICULTURAL FEATURE ENGINEERING
+# =====================================================================
+
+def feature_engineering():
+
+    rows = []
+
+    for variant in [
+        "Original",
+        "Annual_Interactions"
+    ]:
+
+        a = TRAIN[FEATURES].copy()
+        b = TEST[FEATURES].copy()
+
+        if variant == "Annual_Interactions":
+
+            for frame in [a, b]:
+
+                frame["rain_temp_interaction"] = (
+                    frame["average_rain_fall_mm_per_year"]
+                    * frame["avg_temp"]
+                )
+
+                frame["temperature_squared"] = (
+                    frame["avg_temp"] ** 2
+                )
+
+        cols = list(a.columns)
+
+        processor = make_processor(cols)
+
+        Xa = processor.fit_transform(a)
+        Xb = processor.transform(b)
+
+        for name in ["RF", "XGBoost"]:
+
+            model = (
+                create_rf(RF_HP)
+                if name == "RF"
+                else create_xgb(XGB_HP)
+            )
+
+            model.fit(Xa, TRAIN[TARGET])
+
+            rows.append({
+                "Feature_Set": variant,
+                "Model": name,
+                **calculate_metrics(
+                    Y_TEST,
+                    model.predict(Xb)
+                )
+            })
+
+    save_table(
+        "RA_M1",
+        "feature_engineering",
+        pd.DataFrame(rows),
+        "Original versus engineered annual features"
+    )
+
+if CFG["run_feature_engineering"]:
+    run_stage(
+        "Feature engineering experiment",
+        feature_engineering
+    )
+
+# =====================================================================
+# 24. CATBOOST BENCHMARK
+# =====================================================================
+
+def catboost_baseline():
+
+    if not HAS_CATBOOST:
+        raise RuntimeError(
+            "CatBoost package unavailable"
+        )
+
+    start = time.perf_counter()
+
+    model = CatBoostRegressor(
+        iterations=300,
+        depth=6,
+        learning_rate=0.05,
+        random_seed=SEED,
+        thread_count=2,
+        loss_function="RMSE",
+        verbose=False
+    )
+
+    model.fit(
+        TRAIN[FEATURES],
+        TRAIN[TARGET],
+        cat_features=CATEGORICAL
+    )
+
+    elapsed = time.perf_counter() - start
+
+    predicted = model.predict(TEST[FEATURES])
+
+    save_table(
+        "RA_R3",
+        "catboost_benchmark",
+        pd.DataFrame([{
+            "Model": "CatBoost",
+            "Fit_Seconds": elapsed,
+            **calculate_metrics(
+                Y_TEST,
+                predicted
+            )
+        }]),
+        "CatBoost comparison on identical held-out data"
+    )
+
+run_stage("CatBoost benchmark", catboost_baseline)
+
+# =====================================================================
+# 25. TABULAR ATTENTION DEEP LEARNING COMPARATOR
+# =====================================================================
+
+def attention_comparator():
+
+    _, Xa, Xb = prepare_features(
+        TRAIN,
+        TEST
+    )
+
+    scaler = make_y_scaler(
+        TRAIN[TARGET]
+    )
+
+    ya = scale_target(
+        scaler,
+        TRAIN[TARGET]
+    )
+
+    tf.keras.backend.clear_session()
+    tf.keras.utils.set_random_seed(SEED)
+
+    inputs = tf.keras.Input(
+        shape=(Xa.shape[1],)
+    )
+
+    x = tf.keras.layers.Reshape(
+        (Xa.shape[1], 1)
+    )(inputs)
+
+    x = tf.keras.layers.Dense(16)(x)
+
+    attended = tf.keras.layers.MultiHeadAttention(
+        num_heads=2,
+        key_dim=8
+    )(x, x)
+
+    x = tf.keras.layers.LayerNormalization()(
+        x + attended
+    )
+
+    x = tf.keras.layers.GlobalAveragePooling1D()(x)
+
+    x = tf.keras.layers.Dense(
+        64,
+        activation="relu"
+    )(x)
+
+    output = tf.keras.layers.Dense(1)(x)
+
+    model = tf.keras.Model(inputs, output)
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-3),
+        loss="mse",
+        metrics=["mae"]
+    )
+
+    start = time.perf_counter()
+
+    history = model.fit(
+        Xa,
+        ya,
+        validation_split=0.10,
+        epochs=CFG["nn_max_epochs"],
+        batch_size=CFG["batch_size"],
+        callbacks=[
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_loss",
+                patience=CFG["nn_patience"],
+                restore_best_weights=True
+            )
+        ],
+        verbose=0
+    )
+
+    elapsed = time.perf_counter() - start
+
+    predicted = inverse_target(
+        scaler,
+        predict_nn(model, Xb)
+    )
+
+    save_table(
+        "RA_O3",
+        "attention_deep_learning_baseline",
+        pd.DataFrame([{
+            "Model": "Custom_Tabular_Attention",
+            "Fit_Seconds": elapsed,
+            **calculate_metrics(Y_TEST, predicted)
+        }]),
+        "Custom tabular attention comparator"
+    )
+
+    plt.figure(figsize=(9, 5.5))
+
+    plt.plot(
+        history.history["loss"],
+        label="Training"
+    )
+
+    plt.plot(
+        history.history["val_loss"],
+        label="Validation"
+    )
+
+    plt.xlabel("Epoch")
+    plt.ylabel("MSE (normalized target)")
+    plt.title(
+        "Tabular Attention Learning Curves"
+    )
+    plt.legend()
+
+    save_fig(
+        "RA_O3",
+        "attention_learning_curve",
+        "Tabular attention training history"
+    )
+
+if CFG["run_attention_comparator"]:
+    run_stage(
+        "Tabular attention comparator",
+        attention_comparator
+    )
+
+# =====================================================================
+# 26. CHRONOLOGICAL VALIDATION
+# RA Methodology 2 — Results 8
+# =====================================================================
+
+def temporal_validation():
+
+    years = np.sort(
+        data.Year.unique()
+    )
+
+    cutoff = (
+        2015
+        if (
+            (data.Year < 2015).sum() >= 100
+            and (data.Year >= 2015).sum() >= 50
+        )
+        else int(np.quantile(years, 0.75))
+    )
+
+    past = data[
+        data.Year < cutoff
+    ].reset_index(drop=True)
+
+    future = data[
+        data.Year >= cutoff
+    ].reset_index(drop=True)
+
+    if len(past) < 100 or len(future) < 40:
+        raise ValueError(
+            "Insufficient records for temporal validation"
+        )
+
+    # Retune model hyperparameters using only historical data.
+
+    rf, _ = tune_tree("RF", past)
+    xgb, _ = tune_tree("XGBoost", past)
+    nn, _ = tune_nn(past, "temporal")
+
+    temporal_hp = {
+        "RF": rf,
+        "XGBoost": xgb,
+        "NN": nn
+    }
+
+    result = run_stacking(
+        past,
+        future,
+        temporal_hp,
+        include_linear=False
+    )
+
+    records = []
+
+    for name in BASE + ["Stack_Ridge"]:
+
+        records.append({
+            "Model": name,
+            "Train_Before": cutoff,
+            "Test_From": cutoff,
+            "Train_Rows": len(past),
+            "Test_Rows": len(future),
+            **calculate_metrics(
+                future[TARGET],
+                result["predictions"][name]
+            )
+        })
+
+    save_table(
+        "RA_M2_RA_R8",
+        "temporal_model_results",
+        pd.DataFrame(records),
+        "Chronological validation with historical-only tuning"
+    )
+
+if CFG["run_temporal_validation"]:
+    run_stage(
+        "Chronological validation",
+        temporal_validation
+    )
+
+# =====================================================================
+# 27. OUTER CROSS-VALIDATION
+# RA Technical 2 — Technical 4
+# =====================================================================
+
+def outer_cross_validation():
+
+    outer = KFold(
+        n_splits=CFG["outer_cv_folds"],
+        shuffle=True,
+        random_state=SEED
+    )
+
+    results = []
+
+    for fold, (a, b) in enumerate(
+        outer.split(data),
+        start=1
+    ):
+
+        print(
+            f"\nOuter fold {fold}/{CFG['outer_cv_folds']}"
+        )
+
+        fold_train = data.iloc[a].reset_index(drop=True)
+        fold_test = data.iloc[b].reset_index(drop=True)
+
+        # IMPORTANT: Retune independently inside outer train.
+        rf, _ = tune_tree("RF", fold_train)
+        xgb, _ = tune_tree("XGBoost", fold_train)
+        nn, _ = tune_nn(
+            fold_train,
+            f"outer_{fold}"
+        )
+
+        fold_hp = {
+            "RF": rf,
+            "XGBoost": xgb,
+            "NN": nn
+        }
+
+        fold_result = run_stacking(
+            fold_train,
+            fold_test,
+            fold_hp,
+            include_linear=False
+        )
+
+        for name in BASE + ["Stack_Ridge"]:
+
+            results.append({
+                "Fold": fold,
+                "Model": name,
+                **calculate_metrics(
+                    fold_test[TARGET],
+                    fold_result["predictions"][name]
+                )
+            })
+
+        save_table(
+            "RA_T2_RA_T4",
+            f"outer_cv_progress_fold_{fold}",
+            pd.DataFrame(results),
+            "Completed outer-fold validation results"
+        )
+
+    frame = pd.DataFrame(results)
+
+    summary = frame.groupby("Model")[
+        ["MAE", "RMSE", "R2"]
+    ].agg(["mean", "std"])
+
+    summary.columns = [
+        "_".join(c)
+        for c in summary.columns
+    ]
+
+    summary = summary.reset_index()
+
+    save_table(
+        "RA_T2_RA_T4",
+        "outer_cv_summary",
+        summary,
+        "Outer-fold performance mean and standard deviation"
+    )
+
+    plt.figure(figsize=(9, 5.5))
+
+    for name, group in frame.groupby("Model"):
+
+        plt.plot(
+            group.Fold,
+            group.R2,
+            marker="o",
+            label=name
+        )
+
+    plt.xlabel("Outer Fold")
+    plt.ylabel("R²")
+    plt.title("Cross-Validation Performance")
+    plt.legend()
+
+    save_fig(
+        "RA_T2_RA_T4",
+        "outer_cv_r2",
+        "Outer cross-validation R² comparison"
+    )
+
+if CFG["run_outer_cv"]:
+    run_stage(
+        "Nested outer cross-validation",
+        outer_cross_validation
+    )
+
+# =====================================================================
+# 28. COMPUTATIONAL EFFICIENCY AND SCALABILITY
+# RA Technical 3 — RB Major 1 — RB Q5
+# =====================================================================
+
+def scalability_analysis():
+
+    rows = []
+    stack_rows = []
+
+    for factor in CFG["scalability_factors"]:
+
+        print(f"\nBenchmarking {factor}x dataset size")
+
+        workload = TRAIN.sample(
+            n=len(TRAIN) * factor,
+            replace=(factor > 1),
+            random_state=SEED + factor
+        ).reset_index(drop=True)
+
+        _, X, _ = prepare_features(
+            workload,
+            TEST
+        )
+
+        scaler = make_y_scaler(
+            workload[TARGET]
+        )
+
+        y = scale_target(
+            scaler,
+            workload[TARGET]
+        )
+
+        for name in BASE:
+
+            start = time.perf_counter()
+
+            model = fit_base(
+                name,
+                X,
+                y,
+                HP
+            )
+
+            train_seconds = (
+                time.perf_counter() - start
+            )
+
+            batch = X[:min(100, len(X))]
+
+            # Warm-up.
+            predict_base(name, model, batch)
+
+            samples = []
+
+            for repeat in range(5):
+
+                start = time.perf_counter()
+
+                predict_base(
+                    name,
+                    model,
+                    batch
+                )
+
+                samples.append(
+                    time.perf_counter() - start
+                )
+
+            latency = (
+                1000 * np.median(samples) / len(batch)
+            )
+
+            rows.append({
+                "Scale": factor,
+                "Observations": len(workload),
+                "Model": name,
+                "Training_Seconds": train_seconds,
+                "Inference_ms_per_sample": latency,
+                "Workload": (
+                    "Original records"
+                    if factor == 1
+                    else "Replicated computational workload"
+                )
+            })
+
+        # Whole stacking model, including OOF fitting.
+        start = time.perf_counter()
+
+        test_batch = TEST.iloc[
+            :min(100, len(TEST))
+        ]
+
+        stack = run_stacking(
+            workload,
+            test_batch,
+            HP,
+            include_linear=False
+        )
+
+        elapsed = time.perf_counter() - start
+
+        # End-to-end stacking inference.
+        stack["predict"](test_batch)
+
+        repeats = []
+
+        for repeat in range(5):
+            start = time.perf_counter()
+            stack["predict"](test_batch)
+            repeats.append(
+                time.perf_counter() - start
+            )
+
+        stack_rows.append({
+            "Scale": factor,
+            "Observations": len(workload),
+            "OOF_Seconds": stack["oof_seconds"],
+            "Total_Training_Seconds": elapsed,
+            "Inference_ms_per_sample": (
+                1000 * np.median(repeats) /
+                len(test_batch)
+            ),
+            "Workload": (
+                "Original records"
+                if factor == 1
+                else "Replicated computational workload"
+            )
+        })
+
+        # Save incrementally after every scale.
+
+        save_table(
+            "RA_T3_RB_M1_RB_Q5",
+            "base_scalability_progress",
+            pd.DataFrame(rows),
+            "Base-learner scalability benchmark"
+        )
+
+        save_table(
+            "RA_T3_RB_M1_RB_Q5",
+            "stack_scalability_progress",
+            pd.DataFrame(stack_rows),
+            "Stacking scalability benchmark"
+        )
+
+    base_frame = pd.DataFrame(rows)
+    stack_frame = pd.DataFrame(stack_rows)
+
+    plt.figure(figsize=(9, 5.5))
+
+    for name, group in base_frame.groupby("Model"):
+
+        group = group.sort_values("Observations")
+
+        plt.plot(
+            group.Observations,
+            group.Training_Seconds,
+            marker="o",
+            label=name
+        )
+
+    plt.xlabel("Training Observations")
+    plt.ylabel("Training Time (seconds)")
+    plt.title("Base-Model Training Scalability")
+    plt.legend()
+
+    save_fig(
+        "RA_T3_RB_M1_RB_Q5",
+        "base_training_scalability",
+        "Training time versus dataset scale"
+    )
+
+    plt.figure(figsize=(9, 5.5))
+
+    plt.plot(
+        stack_frame.Observations,
+        stack_frame.Total_Training_Seconds,
+        marker="o"
+    )
+
+    plt.xlabel("Training Observations")
+    plt.ylabel("Total Training Time (seconds)")
+    plt.title("Stacking Ensemble Scalability")
+
+    save_fig(
+        "RA_T3_RB_M1_RB_Q5",
+        "stack_training_scalability",
+        "End-to-end stacking training time"
+    )
+
+    plt.figure(figsize=(9, 5.5))
+
+    plt.plot(
+        stack_frame.Observations,
+        stack_frame.Inference_ms_per_sample,
+        marker="o"
+    )
+
+    plt.xlabel("Training Observations")
+    plt.ylabel("Inference Time (ms/sample)")
+    plt.title("Stacking Ensemble Inference Latency")
+
+    save_fig(
+        "RA_T3_RB_M1_RB_Q5",
+        "stack_inference_scalability",
+        "End-to-end stacking inference latency"
+    )
+
+if CFG["run_scalability"]:
+    run_stage(
+        "Training and inference scalability",
+        scalability_analysis
+    )
+
+# =====================================================================
+# 29. CORRELATION ANALYSIS
+# RA Results 6
+# =====================================================================
+
+def correlation_analysis():
+
+    numerical = data[
+        NUMERICAL + [TARGET]
+    ].corr(numeric_only=True)
+
+    save_table(
+        "RA_R6",
+        "numeric_correlation_matrix",
+        numerical.reset_index().rename(
+            columns={"index": "Feature"}
+        ),
+        "Correlation matrix of numerical variables"
+    )
+
+    plt.figure(figsize=(9, 7))
+
+    plt.imshow(
+        numerical.values,
+        vmin=-1,
+        vmax=1,
+        cmap="coolwarm"
+    )
+
+    plt.colorbar(
+        label="Pearson Correlation"
+    )
+
+    ticks = range(len(numerical.columns))
+
+    plt.xticks(
+        ticks,
+        numerical.columns,
+        rotation=45,
+        ha="right"
+    )
+
+    plt.yticks(
+        ticks,
+        numerical.index
+    )
+
+    for i in ticks:
+        for j in ticks:
+            plt.text(
+                j,
+                i,
+                f"{numerical.iloc[i, j]:.2f}",
+                ha="center",
+                va="center",
+                fontsize=9
+            )
+
+    plt.title(
+        "Correlation Matrix of Numerical Agricultural Variables"
+    )
+
+    save_fig(
+        "RA_R6",
+        "numeric_correlation_heatmap",
+        "Numerical feature correlation heatmap"
+    )
+
+run_stage(
+    "Correlation analysis",
+    correlation_analysis
+)
+
+# =====================================================================
+# 30. REPRODUCIBILITY AND ENVIRONMENT
+# =====================================================================
+
+environment = {
+    "Python": sys.version,
+    "Platform": platform.platform(),
+    "NumPy": np.__version__,
+    "Pandas": pd.__version__,
+    "Scikit_learn": __import__("sklearn").__version__,
+    "XGBoost": __import__("xgboost").__version__,
+    "TensorFlow": tf.__version__,
+    "Keras_Tuner": getattr(kt, "__version__", "unknown"),
+    "Random_Seed": SEED,
+    "Dataset_Path": DATA_PATH,
+    "Dataset_SHA256": DATA_HASH,
+    "Configuration": CFG,
+    "Selected_Hyperparameters": HP,
+    "Selected_Ridge_Alpha": MAIN["selected_alpha"],
+    "NNLS_Weights": MAIN["nnls_weights"].tolist()
+}
+
+if HAS_PSUTIL:
+
+    environment["CPU_Count"] = psutil.cpu_count()
+
+    environment["RAM_GB"] = (
+        psutil.virtual_memory().total / 1024**3
+    )
+
+environment["GPUs"] = [
+    d.name
+    for d in tf.config.list_physical_devices("GPU")
+]
+
+(META_DIR / "experimental_environment.json").write_text(
+    json.dumps(
+        environment,
+        indent=2,
+        default=str
+    )
+)
+
+# =====================================================================
+# 31. FINAL OUTPUT SUMMARY
+# =====================================================================
+
+save_progress()
+
+failures = [
+    row
+    for row in EXECUTION_LOG
+    if row["status"] == "FAILED"
+]
+
+figure_count = len(
+    list(FIG_DIR.glob("*.png"))
+)
+
+table_count = len(
+    list(TABLE_DIR.glob("*.csv"))
+)
+
+print("\n" + "=" * 72)
+print("SOIC FULL EXPERIMENTAL PIPELINE COMPLETED")
+print("=" * 72)
+
+print("DATASET:", DATA_PATH)
+print("OUTPUT:", OUT)
+print("FIGURES:", FIG_DIR)
+print("TABLES:", TABLE_DIR)
+print("METADATA:", META_DIR)
+print("PNG FIGURES:", figure_count)
+print("CSV TABLES:", table_count)
+print("FAILED STAGES:", len(failures))
+
+if failures:
+
+    print("\nFAILED EXPERIMENTS:")
+
+    for row in failures:
+        print(
+            row["stage"],
+            "->",
+            row["details"]
+        )
+
+else:
+    print(
+        "\nNo stage failures were recorded."
+    )
+
+print(
+    "\nReviewer mapping:",
+    OUT / "reviewer_artifact_index.csv"
+)
+
+print(
+    "Execution log:",
+    OUT / "execution_log.csv"
+)
+
+print("\nIMPORTANT:")
+print(
+    "Review numerical results, methodology, and completed stages "
+    "before using them in the manuscript."
+)
